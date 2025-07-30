@@ -1,0 +1,1103 @@
+import MetaTrader5 as mt5
+import time
+import os
+import json
+import pygame
+import threading
+import tkinter as tk
+from tkinter import messagebox
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, getcontext
+import sys
+
+import re
+
+def remove_emoji(text):
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # emoticons
+        "\U0001F300-\U0001F5FF"  # symbols & pictographs
+        "\U0001F680-\U0001F6FF"  # transport & map symbols
+        "\U0001F1E0-\U0001F1FF"  # flags (iOS)
+        "\u2600-\u26FF"          # miscellaneous symbols
+        "\u2700-\u27BF"          # dingbats
+        "]+",
+        flags=re.UNICODE)
+    return emoji_pattern.sub(r'', text)
+
+# Ensure consistent decimal precision globally
+getcontext().prec = 10
+
+# === Constants and Configurations ===
+TRADE_COUNTER_FILE = "max_trade_counter.txt"
+
+# === Functions to Load/Save Trade Data ===
+def load_trade_data():
+    """
+    Load max trade count and script start time from a file.
+    Returns:
+        max_count (int)
+        start_time (datetime)
+    """
+    try:
+        with open(TRADE_COUNTER_FILE, "r") as f:
+            lines = f.readlines()
+        data = {}
+        for line in lines:
+            if ":" in line:
+                key, value = line.strip().split(":", 1)
+                data[key.strip()] = value.strip()
+        max_count = int(data.get("MAX_TRADE_COUNT", "0"))
+        start_time_str = data.get("SCRIPT_START_TIME", None)
+        try:
+            start_time = datetime.strptime(start_time_str, "%Y-%m-%d %H:%M:%S") if start_time_str else datetime.now()
+        except ValueError:
+            start_time = datetime.now()
+        return max_count, start_time
+    except FileNotFoundError:
+        return 0, datetime.now()
+
+def save_trade_data(max_count: int, start_time: datetime):
+    """
+    Save max trade count and script start time to file.
+    """
+    with open(TRADE_COUNTER_FILE, "w") as f:
+        f.write(f"MAX_TRADE_COUNT: {max_count}\n")
+        f.write(f"SCRIPT_START_TIME: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+# === Time Utilities ===
+def get_amman_date():
+    """
+    Return current date in Amman timezone (UTC+3)
+    """
+    return datetime.now(timezone(timedelta(hours=3))).date()
+
+# === MT5 Related Helper Functions ===
+def get_floating_loss(symbol: str, comment_key: str = None) -> Decimal:
+    """
+    Calculate total floating LOSS (only negative profit) for symbol and optional comment filter.
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        print(f"No positions found or error: {mt5.last_error()}")
+        return Decimal("0.0")
+
+    floating_loss = Decimal("0.0")
+    for pos in positions:
+        if comment_key and comment_key not in pos.comment:
+            continue
+        profit = Decimal(str(pos.profit))
+        if profit < 0:
+            floating_loss += abs(profit)  # convert to positive loss amount
+    return floating_loss
+
+# === Load trade count and start time on startup ===
+MAX_TRADE_COUNT, SCRIPT_START_TIME = load_trade_data()
+save_trade_data(MAX_TRADE_COUNT, datetime.now())  # update start time to now
+
+# === Initialize MT5 ===
+if not mt5.initialize():
+    print(f"MT5 initialization failed: {mt5.last_error()}")
+    exit()
+
+# === Debug: list symbols containing US500Roll for info ===
+symbols = mt5.symbols_get()
+for sym in symbols:
+    if "XAUUSD" in sym.name:
+        print(f"Symbol: {sym.name}, Step: {sym.volume_step}, Min: {sym.volume_min}, Max: {sym.volume_max}")
+
+# === Load JSON config (must be in same directory) ===
+with open("configbuy.json", "r") as f:
+    cfg = json.load(f)
+
+# Extract config values
+LOT = cfg["LOT"]
+DOLLARS_PER_LOT_SL = cfg["DOLLARS_PER_LOT_SL"]
+USE_ONLY_PRELIMINARY_SL = cfg["USE_ONLY_PRELIMINARY_SL"]
+SLEEP_INTERVAL = cfg["SLEEP_INTERVAL"]
+PROFIT_TARGET_MODE = cfg["PROFIT_TARGET_MODE"]
+LOSS_TARGET_MODE = cfg["LOSS_TARGET_MODE"]
+MAX_TRADES = cfg["MAX_TRADES"]
+TRAILING_TRIGGER_DOLLARS = cfg["TRAILING_TRIGGER_DOLLARS"]
+TRAILING_SL_DOLLARS = cfg["TRAILING_SL_DOLLARS"]
+SOUND_VOLUME = cfg["SOUND_VOLUME"]
+SYMBOL = cfg["SYMBOL"]
+COMMENT_KEY = cfg["COMMENT_KEY"]
+MAGIC_NUMBER = cfg["MAGIC_NUMBER"]
+
+# Example override if needed
+SYMBOL = "XAUUSD"
+LOT = 0.01
+DOLLARS_PER_LOT_SL = 800
+PRELIMINARY_SL_DOLLARS = DOLLARS_PER_LOT_SL * LOT
+
+TRAILING_TRIGGER_DOLLARS_PER_LOT = 100  # must be larger than TRAILING_SL_DOLLARS_PER_LOT
+TRAILING_TRIGGER_DOLLARS = TRAILING_TRIGGER_DOLLARS_PER_LOT * LOT
+TRAILING_SL_DOLLARS_PER_LOT = 50      # must be less than TRAILING_TRIGGER_DOLLARS_PER_LOT
+TRAILING_SL_DOLLARS = TRAILING_SL_DOLLARS_PER_LOT * LOT
+NEW_TRAILING_SL_DOLLARS_PER_LOT = 1000
+Emergency_Stop_Loss = '30'
+
+
+
+force_close = True  # Whether to force close on market open if needed
+
+# === Initialize Pygame Sound ===
+SOUND_FILE = "signal.wav"
+pygame.mixer.init()
+pygame.mixer.music.set_volume(SOUND_VOLUME)
+SOUND_VOLUME = 0.8
+
+def play_sound(times=1):
+    pygame.mixer.music.load(SOUND_FILE)
+    for _ in range(times):
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.1)
+
+play_sound(times=1)
+
+# === Stop loss / trailing config ===
+ENABLE_TRAILING = True
+
+# === Other constants ===
+SLEEP_INTERVAL = 10  # seconds between trading loop iterations
+MAX_TRADES = 5
+COMMENT_KEY = "trail_buy_XAUUSD"
+MAGIC_NUMBER=123121
+
+def get_account_equity():
+    account_info = mt5.account_info()
+    if account_info is None:
+        print("Failed to get account info.")
+        return None
+    return account_info.equity
+
+initial_equity = get_account_equity()
+if initial_equity is None:
+    print("Failed to fetch account equity. Exiting.")
+    mt5.shutdown()
+    exit()
+
+# Thresholds calculated from initial equity
+FLOATING_PROFIT_PROTECT_THRESHOLD = initial_equity * 0.007  # e.g. 0.7%
+FLOATING_LOSS_LIMIT_PERCENT = 0.003  # e.g. 0.3% relative to closed profits today
+
+# Fetch symbol info and validate
+symbol_info = mt5.symbol_info(SYMBOL)
+if symbol_info is None:
+    print(f"Symbol {SYMBOL} not found.")
+    mt5.shutdown()
+    exit()
+
+point = symbol_info.point
+tick_value = symbol_info.trade_tick_value
+
+# === Helper to load and update persistent total profit tracker ===
+def load_and_update_total_profit(symbol, comment_key, magic_number, filename="total_profit_tracker.json"):
+    utc_now = datetime.now(timezone.utc)
+    utc_from = utc_now - timedelta(days=10)  # look back period for deal history
+
+    # Load existing data if present
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError:
+                data = {}
+    else:
+        data = {}
+
+    last_profit = data.get("total_profit", 0.0)
+    last_time_str = data.get("last_time", "1970-01-01T00:00:00+00:00")
+    last_time = datetime.fromisoformat(last_time_str)
+
+    # Fetch new closed deals since last_time
+    deals = mt5.history_deals_get(last_time, utc_now)
+    if deals is None:
+        print("No deal history found.")
+        return last_profit
+
+    new_profit = 0.0
+    for deal in deals:
+        if (deal.symbol == symbol and
+            deal.magic == magic_number and
+            comment_key in deal.comment and
+            deal.entry == mt5.DEAL_ENTRY_OUT):
+            new_profit += deal.profit
+
+    updated_profit = last_profit + new_profit
+
+    # Save updated profit and timestamp
+    data["total_profit"] = updated_profit
+    data["last_time"] = utc_now.isoformat()
+    with open(filename, "w") as f:
+        json.dump(data, f)
+
+    return updated_profit
+
+
+# === Helper: fetch closed deals filtered by symbol/comment, adjusted to Amman time ===
+def get_closed_deals_amman(symbol=None, comment_key=None, days_back=1):
+    utc_now = datetime.now(timezone.utc)
+    utc_from = utc_now - timedelta(days=days_back)
+    deals = mt5.history_deals_get(utc_from, utc_now)
+
+    if deals is None:
+        print("No deal history found.")
+        return []
+
+    amman_deals = []
+    for deal in deals:
+        if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue  # Only closed deals
+
+        if symbol and deal.symbol != symbol:
+            continue
+        if comment_key and comment_key not in deal.comment:
+            continue
+
+        deal_dict = {
+            "ticket": deal.ticket,
+            "symbol": deal.symbol,
+            "volume": deal.volume,
+            "price": deal.price,
+            "profit": deal.profit,
+            "type": deal.type,
+            "comment": deal.comment,
+            "time_amman": datetime.fromtimestamp(deal.time, tz=timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        amman_deals.append(deal_dict)
+
+    return amman_deals
+
+# === Helper: Close all positions for a symbol ===
+def close_all_positions(symbol):
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        print("No open positions to close.")
+        return True
+
+    all_closed = True
+    for pos in positions:
+        volume = pos.volume
+        ticket = pos.ticket
+        # Determine closing order type (opposite of current)
+        order_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            print("Tick data unavailable for closing positions.")
+            all_closed = False
+            continue
+
+        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": order_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER,
+            "comment": "Auto-close profit target",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+
+        result = mt5.order_send(request)
+
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"Failed to close position ticket {ticket}. Retcode: {result.retcode if result else 'None'}. Error: {mt5.last_error()}")
+            all_closed = False
+            continue
+
+        print(f"Position closed: ticket {ticket}, volume {volume}")
+
+    return all_closed
+
+
+# Preliminary SL and trailing SL in price points (based on lot size and tick value)
+prelim_sl_points = PRELIMINARY_SL_DOLLARS / (tick_value * LOT)
+trailing_sl_points = TRAILING_SL_DOLLARS / (tick_value * LOT)
+
+def get_account_equity():
+    """
+    Fetch current account equity.
+    Returns:
+        float or None
+    """
+    account_info = mt5.account_info()
+    if account_info is None:
+        return None
+    return account_info.equity
+
+def calculate_today_net_profit(symbol, comment_key, from_time=None):
+    now_utc = datetime.now(timezone.utc)
+    if from_time is None:
+        # default: start of current Amman day
+        now_amman = datetime.now(timezone(timedelta(hours=3)))
+        start_of_day = now_amman.replace(hour=0, minute=0, second=0, microsecond=0)
+        from_time = start_of_day.astimezone(timezone.utc)
+    
+    deals = mt5.history_deals_get(from_time, now_utc)
+    if deals is None:
+        return 0.0
+
+    total_profit = 0.0
+    for deal in deals:
+        if (deal.symbol == symbol and
+            comment_key in deal.comment and
+            deal.profit != 0 and
+            deal.entry == mt5.DEAL_ENTRY_OUT):
+            total_profit += deal.profit
+
+    return total_profit
+
+
+# Filenames for tracking trade count and first run flag
+script_name = os.path.splitext(os.path.basename(__file__))[0]
+COUNTER_FILE = f"trade_counter_{script_name}.txt"
+FIRST_RUN_FLAG_FILE = f"first_run_flag_{script_name}.txt"
+
+def now_amman():
+    """Get current time string in Amman timezone (UTC+3)."""
+    return datetime.now(timezone(timedelta(hours=3))).strftime("%Y-%m-%d %H:%M:%S")
+
+def load_trade_count():
+    """
+    Load the trade count from file. 
+    If first run, reset count to zero and create first run flag.
+    """
+    if not os.path.exists(FIRST_RUN_FLAG_FILE):
+        save_trade_count(0)
+        with open(FIRST_RUN_FLAG_FILE, "w") as f:
+            f.write("initialized")
+        print("First run detected - trade counter reset to 0")
+        return 0
+
+    if os.path.exists(COUNTER_FILE):
+        try:
+            with open(COUNTER_FILE, "r") as f:
+                return int(f.read().strip())
+        except Exception:
+            pass
+    return 0
+
+def save_trade_count(count):
+    """Save the current trade count to file."""
+    with open(COUNTER_FILE, "w") as f:
+        f.write(str(count))
+
+def show_summary_window_nonblocking(profits, total):
+    """
+    Show a non-blocking Tkinter popup window summarizing trades.
+    """
+    def popup():
+        root = tk.Tk()
+        root.title("Trade Summary")
+        root.geometry("400x300")
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+
+        text = tk.Text(root, font=("Courier", 10))
+        text.pack(expand=True, fill=tk.BOTH)
+        text.insert(tk.END, "Trade Summary\n\n")
+        for i, p in enumerate(profits, start=1):
+            text.insert(tk.END, f"Trade {i}: ${p:.2f}\n")
+        text.insert(tk.END, f"\nTotal Profit: ${total:.2f}")
+
+        button = tk.Button(root, text="Close", command=root.destroy)
+        button.pack(pady=10)
+
+        root.mainloop()
+
+    threading.Thread(target=popup, daemon=True).start()
+
+# Constants for support/resistance
+TIMEFRAME_15M = mt5.TIMEFRAME_M15
+NUM_CANDLES = 50
+
+active_sr_popup = None
+
+def get_support_resistance(symbol, timeframe, num_candles):
+    """
+    Calculate support (lowest low) and resistance (highest high) over last `num_candles` candles.
+    """
+    utc_to = datetime.now()
+    utc_from = utc_to - timedelta(minutes=15 * num_candles)
+    rates = mt5.copy_rates_range(symbol, timeframe, utc_from, utc_to)
+    if not rates:
+        return None, None
+
+    lows = [candle['low'] for candle in rates]
+    highs = [candle['high'] for candle in rates]
+
+    support = min(lows)
+    resistance = max(highs)
+
+    return support, resistance
+
+def show_sr_popup_nonblocking(support, resistance, symbol, current_price):
+    """
+    Show a non-blocking popup with support and resistance levels and distances.
+    """
+    global active_sr_popup
+
+    if active_sr_popup is not None:
+        try:
+            active_sr_popup.destroy()
+        except Exception:
+            pass
+        active_sr_popup = None
+
+    def thread_func():
+        global active_sr_popup
+        active_sr_popup = tk.Tk()
+        active_sr_popup.title(f"{symbol} Support & Resistance (15m)")
+        active_sr_popup.geometry("400x200")
+
+        tk.Label(active_sr_popup, text=f"Support (15m low): {support:.2f}", font=("Arial", 14)).pack(pady=5)
+        tk.Label(active_sr_popup, text=f"Resistance (15m high): {resistance:.2f}", font=("Arial", 14)).pack(pady=5)
+        tk.Label(active_sr_popup, text=f"Current Price: {current_price:.2f}", font=("Arial", 14, "bold")).pack(pady=5)
+
+        dist_support = current_price - support
+        dist_resistance = resistance - current_price
+
+        tk.Label(active_sr_popup, text=f"Distance from Support: {dist_support:.2f}", font=("Arial", 12)).pack(pady=2)
+        tk.Label(active_sr_popup, text=f"Distance from Resistance: {dist_resistance:.2f}", font=("Arial", 12)).pack(pady=2)
+
+        tk.Button(active_sr_popup, text="Close", command=active_sr_popup.destroy, font=("Arial", 12)).pack(pady=10)
+
+        active_sr_popup.attributes("-topmost", True)
+        active_sr_popup.lift()
+        active_sr_popup.focus_force()
+
+        active_sr_popup.mainloop()
+
+    threading.Thread(target=thread_func, daemon=True).start()
+
+def get_highest_high(symbol, timeframe, num_candles=4):
+    """
+    Returns highest high of the last `num_candles` fully closed candles on given timeframe.
+    """
+    history_depth = 100
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, history_depth)
+    if not rates or len(rates) < num_candles:
+        print(f"Not enough candles to get highest high ({len(rates) if rates else 0}).")
+        return None
+
+    recent_candles = rates[-num_candles:]
+    highs = [candle['high'] for candle in recent_candles]
+    highest = max(highs)
+    print(f"Highest high of last {num_candles} closed candles: {highest:.5f}")
+    return highest
+
+def get_lowest_low(symbol, timeframe, num_candles=4):
+    """
+    Returns lowest low of the last `num_candles` fully closed candles on given timeframe.
+    """
+    history_depth = 100
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 1, history_depth)
+    if not rates or len(rates) < num_candles:
+        print(f"Not enough candles to get lowest low ({len(rates) if rates else 0}).")
+        return None
+
+    recent_candles = rates[-num_candles:]
+    lows = [candle['low'] for candle in recent_candles]
+    lowest = min(lows)
+    print(f"Lowest low of last {num_candles} closed candles: {lowest:.5f}")
+    return lowest
+
+
+def open_buy_order():
+    global trade_count
+
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if symbol_info is None:
+        print(f"Failed to get symbol info for {SYMBOL}")
+        return None
+
+    point = symbol_info.point
+    stops_level_points = symbol_info.trade_stops_level
+
+    print("Debug info for SL calculation:")
+    print(f"Symbol: {SYMBOL}")
+    print(f"Point size: {point}")
+    print(f"Prelim SL points (prelim_sl_points): {prelim_sl_points}")
+    print(f"Broker trade_stops_level (points): {stops_level_points}")
+
+    # Check max trades limit
+    if trade_count >= MAX_TRADES:
+        print(f"Trade limit reached ({trade_count}/{MAX_TRADES}). Not placing more trades.")
+        return None
+
+    # Check profit target mode to stop trading if target reached
+    if initial_equity is not None and PROFIT_TARGET_MODE > 0:
+        profit_percent = (total_profit / initial_equity)
+        if profit_percent >= PROFIT_TARGET_MODE:
+            print(f"EquityGuard: Net profit reached {profit_percent*100:.2f}% of initial equity. Stop trading.")
+            return None
+
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        print("Tick unavailable")
+        return None
+
+    entry_price = tick.ask
+    if not entry_price or entry_price == 0:
+        print("Invalid entry price from tick data.")
+        return None
+
+    print(f"Entry price: {entry_price}")
+
+    # --- SL Calculation (fixed SL distance) ---
+    fallback_sl = entry_price - prelim_sl_points * point
+    sl_price = fallback_sl
+
+    actual_distance = entry_price - sl_price
+    min_distance = max(stops_level_points * point, point)
+
+    print(f"SL distance = {actual_distance:.5f}, Required minimum = {min_distance:.5f}")
+
+    if actual_distance < min_distance:
+        print(f"SL too close. Required: {min_distance:.5f}, Got: {actual_distance:.5f}")
+        return None
+
+    print(f"{now_amman()} | Preparing BUY order at {entry_price:.5f}, SL at {sl_price:.5f}")
+
+    # --- Volume Calculation ---
+    lot_min = symbol_info.volume_min
+    lot_max = symbol_info.volume_max
+    lot_step = symbol_info.volume_step
+
+    volume = float(LOT)  # Use your LOT variable; ensure it's valid and matches broker requirements
+
+    print(f"Volume check: LOT={LOT}, Step={lot_step}, Min={lot_min}, Max={lot_max}")
+
+    if volume < lot_min or volume > lot_max:
+        print(f"Volume {volume} is outside allowed range ({lot_min} - {lot_max})")
+        return None
+
+    # Optional: round volume to nearest allowed step if needed
+    # volume = round((volume - lot_min) / lot_step) * lot_step + lot_min
+
+    # --- Create order request ---
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": SYMBOL,
+        "volume": volume,
+        "type": mt5.ORDER_TYPE_BUY,
+        "price": entry_price,
+        "sl": sl_price,
+        "deviation": 20,
+        "magic": MAGIC_NUMBER,
+        "comment": COMMENT_KEY,
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+
+    # --- Send order ---
+    result = mt5.order_send(request)
+
+    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        print("Buy order failed.")
+        print("Request:", request)
+        print("Error:", mt5.last_error())
+        if result and result.retcode == 10027:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("AutoTrading Disabled",
+                                 "AutoTrading is disabled in MT5.\nPlease enable it and restart the script.")
+            root.destroy()
+            mt5.shutdown()
+            exit()
+        return None
+
+    print(f"Buy opened: ticket {result.order}, price {entry_price:.2f}, SL {sl_price:.2f}, volume {volume}")
+    trade_count += 1
+    save_trade_count(trade_count)
+    return result.order
+
+
+def manage_trailing_sl(ticket):
+    global SYMBOL, LOT, ENABLE_TRAILING
+
+    # Fetch the position by ticket
+    pos = mt5.positions_get(ticket=ticket)
+    if not pos:
+        print(f"Ticket {ticket}: Position closed or not found.")
+        return False
+
+    position = pos[0]
+    volume = position.volume  # <-- Added this line to fix the undefined volume error
+    direction = position.type  # 0 = BUY, 1 = SELL
+    price_open = position.price_open
+    sl_current = position.sl
+
+    tick = mt5.symbol_info_tick(SYMBOL)
+    if tick is None:
+        print(f"Ticket {ticket}: Tick unavailable during SL management")
+        return True
+
+    point = mt5.symbol_info(SYMBOL).point
+    tick_value = mt5.symbol_info(SYMBOL).trade_tick_value
+
+    # Current price depends on position type
+    current_price = tick.bid if direction == mt5.ORDER_TYPE_BUY else tick.ask
+
+    # Calculate profit in points and dollars
+    if direction == mt5.ORDER_TYPE_BUY:
+        profit_points = (current_price - price_open) / point
+        direction_str = "BUY"
+    elif direction == mt5.ORDER_TYPE_SELL:
+        profit_points = (price_open - current_price) / point
+        direction_str = "SELL"
+    else:
+        print(f"Ticket {ticket}: Unknown order type {direction}")
+        return True
+
+    profit_dollars = profit_points * tick_value * volume
+    print(f"{now_amman()} | {direction_str} | Entry: {price_open:.5f} | "
+          f"Price: {current_price:.5f} | SL: {sl_current:.5f} | Profit: ${profit_dollars:.2f}")
+    print(f"--- Trailing SL Debug ---")
+    print(f"Ticket: {ticket}")
+    print(f"Direction: {direction_str}")
+    print(f"Volume (actual LOT): {volume}")
+    print(f"Entry price: {price_open:.5f}")
+    print(f"Current price: {current_price:.5f}")
+    print(f"Point size: {point}")
+    print(f"Tick value: {tick_value}")
+    print(f"Profit points: {profit_points:.5f}")
+    print(f"Calculated profit (dollars): {profit_dollars:.5f}")
+    print(f"Current SL: {sl_current:.5f}")
+    print(f"Trailing trigger threshold (dollars): {TRAILING_TRIGGER_DOLLARS}")
+    print(f"Trailing enabled: {ENABLE_TRAILING}")
+
+    # Trailing SL Logic
+    print(f"[ Trailing Check] ENABLE_TRAILING={ENABLE_TRAILING}, Profit=${profit_dollars:.2f}, Trigger=${TRAILING_TRIGGER_DOLLARS:.2f}")
+    if ENABLE_TRAILING and profit_dollars >= TRAILING_TRIGGER_DOLLARS:
+        if direction == mt5.ORDER_TYPE_BUY:
+            proposed_sl = current_price - trailing_sl_points * point
+            print(f"Ticket {ticket}: current SL={sl_current:.5f}, proposed SL={proposed_sl:.5f}")
+
+            # Update SL only if proposed_sl is higher (move SL up) or SL not set yet (0)
+            if sl_current != 0 and sl_current >= proposed_sl:
+                print(f"Ticket {ticket}: SL already tighter or equal. No update needed.")
+                return True
+
+            print(f"Ticket {ticket}: Trailing SL update: {sl_current:.5f} ➜ {proposed_sl:.5f}")
+            modify_request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "sl": proposed_sl,
+                "tp": position.tp,
+                "symbol": SYMBOL,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(modify_request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"Ticket {ticket}: Trailing SL updated to {proposed_sl:.5f}")
+                play_sound(times=2)
+            else:
+                print(f"Ticket {ticket}: Failed to update trailing SL. Retcode: {result.retcode}, Error: {mt5.last_error()}")
+
+        elif direction == mt5.ORDER_TYPE_SELL:
+            proposed_sl = current_price + trailing_sl_points * point
+            print(f"Ticket {ticket}: current SL={sl_current:.5f}, proposed SL={proposed_sl:.5f}")
+
+            # Update SL only if proposed_sl is lower (move SL down) or SL not set yet (0)
+            if sl_current != 0 and sl_current <= proposed_sl:
+                print(f"Ticket {ticket}: SL already tighter or equal. No update needed.")
+                return True
+
+            print(f"Ticket {ticket}: Trailing SL update: {sl_current:.5f} ➜ {proposed_sl:.5f}")
+            modify_request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "sl": proposed_sl,
+                "tp": position.tp,
+                "symbol": SYMBOL,
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+            result = mt5.order_send(modify_request)
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"Ticket {ticket}: Trailing SL updated to {proposed_sl:.5f}")
+                play_sound(times=2)
+            else:
+                print(f"Ticket {ticket}: Failed to update trailing SL. Retcode: {result.retcode}, Error: {mt5.last_error()}")
+
+    else:
+        print(f"Ticket {ticket}: Profit below trailing trigger or trailing disabled. No SL movement.")
+
+    return True
+
+
+
+from decimal import Decimal, getcontext
+from datetime import datetime, timezone, timedelta
+import time
+import tkinter as tk
+from tkinter import messagebox
+
+getcontext().prec = 10  # decimal precision
+
+FLOATING_LOSS_LIMIT_PERCENT = Decimal('0.003')  # 0.3%
+
+def is_loss_threshold_exceeded(start_time, symbol):
+    """
+    Check if today's total loss (closed + floating) has exceeded FLOATING_LOSS_LIMIT_PERCENT of balance.
+    """
+    account_info = mt5.account_info()
+    if account_info is None:
+        print("Failed to retrieve account info.")
+        return False
+
+    balance = Decimal(str(account_info.balance))
+    loss_threshold = FLOATING_LOSS_LIMIT_PERCENT * balance
+
+    # Calculate closed loss (negative profits) since start_time
+    closed_loss = Decimal('0')
+    history = mt5.history_deals_get(start_time, datetime.now())
+    if history:
+        for deal in history:
+            if deal.symbol == symbol and deal.profit < 0 and deal.entry == mt5.DEAL_ENTRY_OUT:
+                closed_loss += Decimal(str(deal.profit))
+
+    # Calculate floating loss (negative profits) currently open
+    floating_loss = Decimal('0')
+    positions = mt5.positions_get(symbol=symbol)
+    if positions:
+        for pos in positions:
+            profit = Decimal(str(pos.profit))
+            if profit < 0:
+                floating_loss += profit
+
+    total_loss = closed_loss + floating_loss  # Both negative numbers
+
+    if total_loss <= -loss_threshold:
+        print(f"Loss threshold exceeded: total_loss={total_loss:.2f}, threshold={-loss_threshold:.2f}")
+        return True
+    else:
+        return False
+
+def check_closed_trades_and_popup():
+    utc_to = datetime.now(timezone.utc)
+    utc_from = utc_to - timedelta(days=1)
+    deals = mt5.history_deals_get(utc_from, utc_to)
+    if deals is None:
+        return
+
+    closed_profits = []
+    for deal in deals:
+        if deal.symbol == SYMBOL and COMMENT_KEY in deal.comment and deal.entry == mt5.DEAL_ENTRY_OUT:
+            closed_profits.append(deal.profit)
+
+    if closed_profits:
+        total = sum(closed_profits)
+        print(f"Closed trades today profit: ${total:.2f}")
+        show_summary_window_nonblocking(closed_profits, total)
+
+def prompt_reset_trade_counter():
+    root = tk.Tk()
+    root.withdraw()
+    response = messagebox.askyesno("Reset Trade Counter?", "Do you want to reset the trade counter to 0?")
+    root.destroy()
+    return response
+
+# Initialize trade counter and equity
+save_trade_count(0)
+print("Trade counter reset to 0 at script start (forced reset)")
+
+trade_count = load_trade_count()
+initial_equity = get_account_equity()
+
+if initial_equity is None:
+    print("Failed to fetch account equity. Exiting.")
+    mt5.shutdown()
+    exit()
+
+print(f"Starting script at {now_amman()} with trade count {trade_count}")
+
+total_profit = calculate_today_net_profit(SYMBOL, COMMENT_KEY)
+
+# Initialize daily tracking variables
+last_trading_day = get_amman_date()
+initial_equity = get_account_equity()
+trade_count = load_trade_count()
+
+# Define script start time
+SCRIPT_START_TIME = datetime.now()
+
+def get_account_balance() -> Decimal:
+    account_info = mt5.account_info()
+    if account_info is None:
+        print(f"Could not retrieve account info: {mt5.last_error()}")
+        return Decimal("0.0")
+    return Decimal(str(account_info.balance))
+
+def get_closed_profit_since(start_time: datetime, symbol_filter: str = SYMBOL, comment_key: str = None) -> Decimal:
+    to_time = datetime.now()
+    deals = mt5.history_deals_get(start_time, to_time)
+    if deals is None:
+        print(f"No deal history found or error: {mt5.last_error()}")
+        return Decimal("0.0")
+
+    total_profit = Decimal("0.0")
+    for deal in deals:
+        if deal.entry != mt5.DEAL_ENTRY_OUT:
+            continue
+        if symbol_filter and deal.symbol != symbol_filter:
+            continue
+        if comment_key and comment_key not in deal.comment:
+            continue
+        total_profit += Decimal(str(deal.profit))
+    return total_profit
+
+def get_floating_loss(symbol: str = SYMBOL, comment_key: str = None) -> Decimal:
+    positions = mt5.positions_get(symbol=symbol)
+    if not positions:
+        return Decimal("0.0")
+
+    floating_loss = Decimal("0.0")
+    for pos in positions:
+        if comment_key and comment_key not in pos.comment:
+            continue
+        profit = Decimal(str(pos.profit))
+        if profit < 0:
+            floating_loss += abs(profit)
+    return floating_loss
+
+def is_loss_threshold_exceeded(start_time: datetime, symbol: str = SYMBOL, comment_key: str = None, loss_limit_percent: Decimal = Decimal("0.003")) -> bool:
+    account_info = mt5.account_info()
+    if account_info is None:
+        print("Failed to retrieve account info.")
+        return False
+
+    balance = Decimal(str(account_info.balance))
+    loss_threshold = loss_limit_percent * balance
+
+    closed_profit = get_closed_profit_since(start_time, symbol, comment_key)
+    closed_losses = closed_profit if closed_profit < 0 else Decimal("0.0")
+    floating_loss = get_floating_loss(symbol, comment_key)
+
+    total_loss = abs(closed_losses) + floating_loss
+
+    print(f"Balance: ${balance:.2f} | Closed Losses: ${abs(closed_losses):.2f} | Floating Loss: ${floating_loss:.2f} | Total Loss: ${total_loss:.2f}")
+    print(f"Loss Threshold Limit: ${loss_threshold:.2f}")
+
+    if total_loss >= loss_threshold:
+        print(f"Loss threshold exceeded: total_loss={total_loss:.2f} >= threshold={loss_threshold:.2f}")
+        return True
+
+    return False
+
+### Abort early if loss threshold exceeded
+##if is_loss_threshold_exceeded(SCRIPT_START_TIME, SYMBOL):
+##    print("Loss threshold exceeded. Halting further trading.")
+##    mt5.shutdown()
+##    exit()
+
+import signal
+import sys
+
+stop_trading = False  # global flag
+
+def signal_handler(sig, frame):
+    global stop_trading
+    print("\Shutdown signal received. Stopping trading loop safely...")
+    stop_trading = True
+
+# Register signal handlers for Ctrl+C and termination signals
+signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+signal.signal(signal.SIGTERM, signal_handler)  # Termination
+
+
+stop_trading = False
+
+
+def trailing_sl_loop():
+    while True:
+        try:
+            if not ENABLE_TRAILING:
+                time.sleep(5)
+                continue
+
+            positions = mt5.positions_get(symbol=SYMBOL)
+            if positions:
+                for pos in positions:
+                    if pos.profit >= TRAILING_TRIGGER_DOLLARS:
+                        manage_trailing_sl(pos.ticket)
+        except Exception as e:
+            print(f"[❌ Trailing SL Loop Error] {e}")
+        time.sleep(5)
+import threading
+
+trailing_thread = threading.Thread(target=trailing_sl_loop, daemon=True)
+trailing_thread.start()
+
+
+def emergency_floating_loss_guard():
+    global stop_trading
+    while True:
+        floating_loss = get_floating_loss(SYMBOL, COMMENT_KEY)
+        print(f"[Watchdog] Floating loss: ${floating_loss}")
+        if floating_loss >= Decimal("10") and not stop_trading:
+            print(f" Emergency stop triggered: Floating loss is ${floating_loss}")
+            success = close_all_positions(SYMBOL)
+            if success:
+                print(" Positions closed due to emergency loss.")
+            else:
+                print(" Some positions may not have closed properly.")
+            stop_trading = True
+            return  # Optional: cleaner than os._exit(0)
+        time.sleep(2)
+
+        
+threading.Thread(target=emergency_floating_loss_guard, daemon=True).start()
+
+
+#import os
+
+def main_loop():
+    global trade_count, initial_equity, last_trading_day, stop_trading
+    global TRAILING_SL_DOLLARS_PER_LOT, TRAILING_SL_DOLLARS
+
+    # Adjust this path to the exact folder where your flags are saved
+    flag_dir = "E:/POSITION BUILDER/Position Builder O+ Versions/"
+    flag_path = os.path.join(flag_dir, "close_xauusd.flag")
+
+    while True:
+        if stop_trading:
+            print("Stopping main trading loop due to shutdown signal.")
+            break  # exit the loop cleanly
+
+        # --- Flag check injection START ---
+        print(f"[DEBUG] Checking for flag file at: {flag_path}")
+        if os.path.exists(flag_path):
+            print(f"[FLAG] Detected {flag_path} – Closing trades now.")
+            print(f"[DEBUG] Closing positions for symbol: '{SYMBOL}'")
+            success = close_all_positions(SYMBOL)
+            if success:
+                print("All positions closed successfully due to flag.")
+            else:
+                print("Some positions may not have closed correctly.")
+            os.remove(flag_path)
+            print(f"[FLAG] {flag_path} removed after execution.")
+            stop_trading = True
+            break
+        # --- Flag check injection END ---
+
+        today_closed_profit = calculate_today_net_profit(SYMBOL, COMMENT_KEY, from_time=SCRIPT_START_TIME)
+        current_day = get_amman_date()
+
+        if current_day != last_trading_day:
+            print(f"New trading day detected: {current_day}. Resetting equity and trade count.")
+            initial_equity = get_account_equity()
+            trade_count = 0
+            save_trade_count(trade_count)
+            last_trading_day = current_day
+
+        floating_loss = get_floating_loss(SYMBOL, COMMENT_KEY)
+        print(f"Current floating loss: ${floating_loss:.2f}")
+        print(f"Realized closed profit today: ${today_closed_profit:.2f}")
+
+        if today_closed_profit >= FLOATING_PROFIT_PROTECT_THRESHOLD:
+            if FLOATING_LOSS_LIMIT_PERCENT > 0 and floating_loss >= today_closed_profit * FLOATING_LOSS_LIMIT_PERCENT:
+                print(f"Floating loss ${floating_loss:.2f} exceeds {FLOATING_LOSS_LIMIT_PERCENT*100:.1f}% of today’s profit ${today_closed_profit:.2f}.")
+                print("Stopping further trades to preserve gains.")
+                stop_trading = True
+                break
+
+        positions = mt5.positions_get(symbol=SYMBOL)
+        buy_targets = [p for p in positions if COMMENT_KEY in p.comment and p.type == mt5.ORDER_TYPE_BUY] if positions else []
+
+        # --- Trailing SL adjustment injection START ---
+        if positions:
+            for pos in positions:
+                if COMMENT_KEY not in pos.comment:
+                    continue
+                entry_price = pos.price_open
+                sl_price = pos.sl
+                if entry_price and sl_price:
+                    if pos.type == mt5.ORDER_TYPE_BUY:
+                        sl_gain = sl_price - entry_price
+                    elif pos.type == mt5.ORDER_TYPE_SELL:
+                        sl_gain = entry_price - sl_price
+                    else:
+                        continue
+
+                    if sl_gain >= 1.5 and TRAILING_SL_DOLLARS_PER_LOT != NEW_TRAILING_SL_DOLLARS_PER_LOT:
+                        TRAILING_SL_DOLLARS_PER_LOT = NEW_TRAILING_SL_DOLLARS_PER_LOT
+                        TRAILING_SL_DOLLARS = TRAILING_SL_DOLLARS_PER_LOT * LOT
+                        print(f"[DEBUG] Adjusted TRAILING_SL_DOLLARS_PER_LOT to {TRAILING_SL_DOLLARS_PER_LOT} after ${sl_gain:.2f} SL gain")
+        # --- Trailing SL adjustment injection END ---
+
+        print(f"Active Trades: {len(buy_targets)} | Total Opened: {trade_count}/{MAX_TRADES}")
+
+        if len(buy_targets) == 0 and not stop_trading:
+            ticket = open_buy_order()
+            if ticket:
+                play_sound()
+                print(f"Buy order opened with ticket {ticket}")
+            else:
+                print("No buy order opened this cycle.")
+            time.sleep(SLEEP_INTERVAL)
+            continue
+        else:
+            print(f"Buy position already open or trading stopped. Waiting...")
+##            for pos in buy_targets:
+##                manage_trailing_sl(pos.ticket)
+
+        if not mt5.terminal_info().trade_allowed:
+            print("AutoTrading is disabled. Waiting...")
+            time.sleep(SLEEP_INTERVAL)
+            continue
+
+        total_profit = calculate_today_net_profit(SYMBOL, COMMENT_KEY)
+        print(f"Total profit: ${total_profit:.2f}")
+
+        if PROFIT_TARGET_MODE > 0 and initial_equity and total_profit >= initial_equity * PROFIT_TARGET_MODE:
+            print(f"Equity guard stop: Profit target reached (${total_profit:.2f}). Mode: {PROFIT_TARGET_MODE * 100:.2f}%.")
+            print("Closing all open positions due to profit target reached...")
+            success = close_all_positions(SYMBOL)
+            if success:
+                print("All positions closed successfully.")
+            else:
+                print("Some positions may not have closed correctly.")
+            break
+
+        if LOSS_TARGET_MODE < 0 and initial_equity and total_profit <= initial_equity * LOSS_TARGET_MODE:
+            print(f"Equity guard stop: Loss target reached (${total_profit:.2f}). Mode: {LOSS_TARGET_MODE * 100:.2f}%.")
+            print("Closing all open positions due to loss target reached...")
+            success = close_all_positions(SYMBOL)
+            if success:
+                print("All positions closed successfully.")
+            else:
+                print("Some positions may not have closed correctly.")
+            break
+
+        if trade_count >= MAX_TRADES:
+            print(f"Trade count limit reached ({trade_count}/{MAX_TRADES}). No more trades will be opened.")
+            time.sleep(SLEEP_INTERVAL)
+            continue
+
+        check_closed_trades_and_popup()
+        time.sleep(SLEEP_INTERVAL)
+
+    # After exiting loop, clean up:
+    print("Shutting down MT5 connection...")
+    mt5.shutdown()
+    print("Script exited cleanly.")
+    sys.exit(0)
+
+
+# Start the main trading loop
+main_loop()
+
