@@ -103,7 +103,7 @@ if not mt5.initialize():
 # === Debug: list symbols containing US500Roll for info ===
 symbols = mt5.symbols_get()
 for sym in symbols:
-    if "XAUUSD" in sym.name:
+    if "US500Roll" in sym.name:
         print(f"Symbol: {sym.name}, Step: {sym.volume_step}, Min: {sym.volume_min}, Max: {sym.volume_max}")
 
 # === Load JSON config (must be in same directory) ===
@@ -126,18 +126,52 @@ COMMENT_KEY = cfg["COMMENT_KEY"]
 MAGIC_NUMBER = cfg["MAGIC_NUMBER"]
 
 # Example override if needed
-SYMBOL = "XAUUSD"
-LOT = 0.01
-DOLLARS_PER_LOT_SL = 800
+SYMBOL = "US500Roll"
+LOT = 2
+DOLLARS_PER_LOT_SL = 10
 PRELIMINARY_SL_DOLLARS = DOLLARS_PER_LOT_SL * LOT
 
-TRAILING_TRIGGER_DOLLARS_PER_LOT = 100  # must be larger than TRAILING_SL_DOLLARS_PER_LOT
+TRAILING_TRIGGER_DOLLARS_PER_LOT = 5 # must be larger than TRAILING_SL_DOLLARS_PER_LOT//          Watch out trailing is per lot and yyou are using 1.5 lot in this code for US500Roll
 TRAILING_TRIGGER_DOLLARS = TRAILING_TRIGGER_DOLLARS_PER_LOT * LOT
-TRAILING_SL_DOLLARS_PER_LOT = 50      # must be less than TRAILING_TRIGGER_DOLLARS_PER_LOT
+TRAILING_SL_DOLLARS_PER_LOT = 2.5    # must be less than TRAILING_TRIGGER_DOLLARS_PER_LOT
+NEW_TRAILING_SL_DOLLARS_PER_LOT = 3.5
 TRAILING_SL_DOLLARS = TRAILING_SL_DOLLARS_PER_LOT * LOT
-NEW_TRAILING_SL_DOLLARS_PER_LOT = 1000
-Emergency_Stop_Loss = '30'
+FLOAT_PROFIT_TIGHTEN_THRESHOLD = 7  # USD
+HESITATION_MODE = False  # Controlled live via 'b+' and 'b-' input
+HESITATION_CHECK_INTERVAL = 6  # Seconds (replaces normal loop interval)
+NORMAL_CHECK_INTERVAL = 10     # Normal loop interval when hesitation mode is off
+Emergency_Stop_Loss = '20'
 
+
+
+def prompt_trailing_settings():
+    """
+    Pop-up GUI to get new trailing settings from user.
+    Blocks execution until user inputs values or cancels.
+    """
+    root = tk.Tk()
+    root.withdraw()  # Hide main window
+
+    new_trigger = simpledialog.askfloat(
+        "Adjust Trailing Trigger",
+        "Enter new TRAILING_TRIGGER_DOLLARS_PER_LOT value:",
+        initialvalue=TRAILING_TRIGGER_DOLLARS_PER_LOT,
+        minvalue=0.1)
+
+    new_sl = simpledialog.askfloat(
+        "Adjust Trailing SL",
+        "Enter new TRAILING_SL_DOLLARS_PER_LOT value:",
+        initialvalue=TRAILING_SL_DOLLARS_PER_LOT,
+        minvalue=0.1)
+
+    root.destroy()
+
+    if new_trigger is not None and new_sl is not None:
+        return new_trigger, new_sl
+    else:
+        return None, None
+
+    
 
 
 force_close = True  # Whether to force close on market open if needed
@@ -146,7 +180,6 @@ force_close = True  # Whether to force close on market open if needed
 SOUND_FILE = "signal.wav"
 pygame.mixer.init()
 pygame.mixer.music.set_volume(SOUND_VOLUME)
-SOUND_VOLUME = 0.8
 
 def play_sound(times=1):
     pygame.mixer.music.load(SOUND_FILE)
@@ -162,9 +195,9 @@ ENABLE_TRAILING = True
 
 # === Other constants ===
 SLEEP_INTERVAL = 10  # seconds between trading loop iterations
-MAX_TRADES = 5
-COMMENT_KEY = "trail_buy_XAUUSD"
-MAGIC_NUMBER=123121
+MAX_TRADES = 1
+COMMENT_KEY = "trail_buy_US500"
+MAGIC_NUMBER=123129
 
 def get_account_equity():
     account_info = mt5.account_info()
@@ -180,8 +213,8 @@ if initial_equity is None:
     exit()
 
 # Thresholds calculated from initial equity
-FLOATING_PROFIT_PROTECT_THRESHOLD = initial_equity * 0.007  # e.g. 0.7%
-FLOATING_LOSS_LIMIT_PERCENT = 0.003  # e.g. 0.3% relative to closed profits today
+FLOATING_PROFIT_PROTECT_THRESHOLD = initial_equity * 0.07  # e.g. 0.7%
+FLOATING_LOSS_LIMIT_PERCENT = 0.03  # e.g. 0.3% relative to closed profits today
 
 # Fetch symbol info and validate
 symbol_info = mt5.symbol_info(SYMBOL)
@@ -625,17 +658,21 @@ def open_buy_order():
 
 
 def manage_trailing_sl(ticket):
-    global SYMBOL, LOT, ENABLE_TRAILING
+    global SYMBOL, ENABLE_TRAILING, TRAILING_TRIGGER_DOLLARS, TRAILING_SL_DOLLARS
 
-    # Fetch the position by ticket
     pos = mt5.positions_get(ticket=ticket)
     if not pos:
         print(f"Ticket {ticket}: Position closed or not found.")
         return False
 
     position = pos[0]
-    volume = position.volume  # <-- Added this line to fix the undefined volume error
-    direction = position.type  # 0 = BUY, 1 = SELL
+
+    volume = position.volume
+    if volume is None or volume <= 0:
+        print(f"Ticket {ticket}: Invalid volume {volume}. Cannot proceed with trailing SL.")
+        return False
+
+    direction = position.type
     price_open = position.price_open
     sl_current = position.sl
 
@@ -644,13 +681,20 @@ def manage_trailing_sl(ticket):
         print(f"Ticket {ticket}: Tick unavailable during SL management")
         return True
 
-    point = mt5.symbol_info(SYMBOL).point
-    tick_value = mt5.symbol_info(SYMBOL).trade_tick_value
+    symbol_info = mt5.symbol_info(SYMBOL)
+    if symbol_info is None:
+        print(f"Ticket {ticket}: Symbol info unavailable")
+        return True
 
-    # Current price depends on position type
+    point = symbol_info.point
+    tick_value = symbol_info.trade_tick_value
+    if tick_value == 0:
+        print(f"Ticket {ticket}: Tick value is zero, cannot calculate trailing SL.")
+        return True
+
     current_price = tick.bid if direction == mt5.ORDER_TYPE_BUY else tick.ask
 
-    # Calculate profit in points and dollars
+    # Profit calculation
     if direction == mt5.ORDER_TYPE_BUY:
         profit_points = (current_price - price_open) / point
         direction_str = "BUY"
@@ -662,82 +706,56 @@ def manage_trailing_sl(ticket):
         return True
 
     profit_dollars = profit_points * tick_value * volume
-    print(f"{now_amman()} | {direction_str} | Entry: {price_open:.5f} | "
-          f"Price: {current_price:.5f} | SL: {sl_current:.5f} | Profit: ${profit_dollars:.2f}")
-    print(f"--- Trailing SL Debug ---")
-    print(f"Ticket: {ticket}")
-    print(f"Direction: {direction_str}")
-    print(f"Volume (actual LOT): {volume}")
-    print(f"Entry price: {price_open:.5f}")
-    print(f"Current price: {current_price:.5f}")
-    print(f"Point size: {point}")
-    print(f"Tick value: {tick_value}")
-    print(f"Profit points: {profit_points:.5f}")
-    print(f"Calculated profit (dollars): {profit_dollars:.5f}")
-    print(f"Current SL: {sl_current:.5f}")
-    print(f"Trailing trigger threshold (dollars): {TRAILING_TRIGGER_DOLLARS}")
-    print(f"Trailing enabled: {ENABLE_TRAILING}")
 
-    # Trailing SL Logic
-    print(f"[ Trailing Check] ENABLE_TRAILING={ENABLE_TRAILING}, Profit=${profit_dollars:.2f}, Trigger=${TRAILING_TRIGGER_DOLLARS:.2f}")
-    if ENABLE_TRAILING and profit_dollars >= TRAILING_TRIGGER_DOLLARS:
-        if direction == mt5.ORDER_TYPE_BUY:
-            proposed_sl = current_price - trailing_sl_points * point
-            print(f"Ticket {ticket}: current SL={sl_current:.5f}, proposed SL={proposed_sl:.5f}")
+    # Calculate trailing SL distance in points safely
+    try:
+        trailing_sl_points = TRAILING_SL_DOLLARS / (tick_value * volume)
+    except ZeroDivisionError:
+        print(f"Ticket {ticket}: Division by zero when calculating trailing SL points.")
+        return True
 
-            # Update SL only if proposed_sl is higher (move SL up) or SL not set yet (0)
-            if sl_current != 0 and sl_current >= proposed_sl:
-                print(f"Ticket {ticket}: SL already tighter or equal. No update needed.")
-                return True
-
-            print(f"Ticket {ticket}: Trailing SL update: {sl_current:.5f} ➜ {proposed_sl:.5f}")
-            modify_request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": ticket,
-                "sl": proposed_sl,
-                "tp": position.tp,
-                "symbol": SYMBOL,
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            result = mt5.order_send(modify_request)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"Ticket {ticket}: Trailing SL updated to {proposed_sl:.5f}")
-                play_sound(times=2)
-            else:
-                print(f"Ticket {ticket}: Failed to update trailing SL. Retcode: {result.retcode}, Error: {mt5.last_error()}")
-
-        elif direction == mt5.ORDER_TYPE_SELL:
-            proposed_sl = current_price + trailing_sl_points * point
-            print(f"Ticket {ticket}: current SL={sl_current:.5f}, proposed SL={proposed_sl:.5f}")
-
-            # Update SL only if proposed_sl is lower (move SL down) or SL not set yet (0)
-            if sl_current != 0 and sl_current <= proposed_sl:
-                print(f"Ticket {ticket}: SL already tighter or equal. No update needed.")
-                return True
-
-            print(f"Ticket {ticket}: Trailing SL update: {sl_current:.5f} ➜ {proposed_sl:.5f}")
-            modify_request = {
-                "action": mt5.TRADE_ACTION_SLTP,
-                "position": ticket,
-                "sl": proposed_sl,
-                "tp": position.tp,
-                "symbol": SYMBOL,
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            result = mt5.order_send(modify_request)
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
-                print(f"Ticket {ticket}: Trailing SL updated to {proposed_sl:.5f}")
-                play_sound(times=2)
-            else:
-                print(f"Ticket {ticket}: Failed to update trailing SL. Retcode: {result.retcode}, Error: {mt5.last_error()}")
-
+    # Determine proposed new SL price
+    if direction == mt5.ORDER_TYPE_BUY:
+        proposed_sl = current_price - trailing_sl_points * point
     else:
-        print(f"Ticket {ticket}: Profit below trailing trigger or trailing disabled. No SL movement.")
+        proposed_sl = current_price + trailing_sl_points * point
+
+    # Diagnostic print
+    print(f"{now_amman()} | {direction_str} | Entry: {price_open:.5f} | Price: {current_price:.5f} | SL: {sl_current:.5f} | Profit: ${profit_dollars:.2f}")
+    print(f"[ Trailing SL Debug] Volume: {volume} LOT, Profit Points: {profit_points:.2f}, Profit Dollars: ${profit_dollars:.2f}")
+    print(f"Trailing Enabled: {ENABLE_TRAILING}, SL Trigger: ${TRAILING_TRIGGER_DOLLARS:.2f}, SL Distance (points): {trailing_sl_points:.2f}")
+    print(f"Current SL: {sl_current:.5f}, Proposed SL: {proposed_sl:.5f}")
+
+    # Check if proposed SL is better than current SL
+    if direction == mt5.ORDER_TYPE_BUY and sl_current != 0 and sl_current >= proposed_sl:
+        print("️ New SL is not higher than the current SL. Trailing will not update.")
+        return True
+    elif direction == mt5.ORDER_TYPE_SELL and sl_current != 0 and sl_current <= proposed_sl:
+        print("️ New SL is not lower than the current SL. Trailing will not update.")
+        return True
+
+    # Apply trailing SL only if enabled and profit target met
+    if ENABLE_TRAILING and profit_dollars >= TRAILING_TRIGGER_DOLLARS:
+        print(f" Updating SL from {sl_current:.5f} to {proposed_sl:.5f}")
+        modify_request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "sl": proposed_sl,
+            "tp": position.tp,
+            "symbol": SYMBOL,
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        result = mt5.order_send(modify_request)
+        if result.retcode == mt5.TRADE_RETCODE_DONE:
+            print(f" Ticket {ticket}: SL updated to {proposed_sl:.5f}")
+            play_sound(times=2)
+        else:
+            print(f" Ticket {ticket}: SL update failed. Retcode: {result.retcode}, Error: {mt5.last_error()}")
+    else:
+        print(f" Ticket {ticket}: SL not moved — profit too small or trailing disabled.")
 
     return True
-
 
 
 from decimal import Decimal, getcontext
@@ -874,7 +892,7 @@ def get_floating_loss(symbol: str = SYMBOL, comment_key: str = None) -> Decimal:
             floating_loss += abs(profit)
     return floating_loss
 
-def is_loss_threshold_exceeded(start_time: datetime, symbol: str = SYMBOL, comment_key: str = None, loss_limit_percent: Decimal = Decimal("0.003")) -> bool:
+def is_loss_threshold_exceeded(start_time: datetime, symbol: str = SYMBOL, comment_key: str = None, loss_limit_percent: Decimal = Decimal("0.03")) -> bool:
     account_info = mt5.account_info()
     if account_info is None:
         print("Failed to retrieve account info.")
@@ -898,11 +916,11 @@ def is_loss_threshold_exceeded(start_time: datetime, symbol: str = SYMBOL, comme
 
     return False
 
-### Abort early if loss threshold exceeded
-##if is_loss_threshold_exceeded(SCRIPT_START_TIME, SYMBOL):
-##    print("Loss threshold exceeded. Halting further trading.")
-##    mt5.shutdown()
-##    exit()
+# Abort early if loss threshold exceeded
+if is_loss_threshold_exceeded(SCRIPT_START_TIME, SYMBOL):
+    print("Loss threshold exceeded. Halting further trading.")
+    mt5.shutdown()
+    exit()
 
 import signal
 import sys
@@ -911,7 +929,7 @@ stop_trading = False  # global flag
 
 def signal_handler(sig, frame):
     global stop_trading
-    print("\Shutdown signal received. Stopping trading loop safely...")
+    print("Shutdown signal received. Stopping trading loop safely...")
     stop_trading = True
 
 # Register signal handlers for Ctrl+C and termination signals
@@ -952,9 +970,9 @@ def emergency_floating_loss_guard():
             print(f" Emergency stop triggered: Floating loss is ${floating_loss}")
             success = close_all_positions(SYMBOL)
             if success:
-                print(" Positions closed due to emergency loss.")
+                print("Positions closed due to emergency loss.")
             else:
-                print(" Some positions may not have closed properly.")
+                print("Some positions may not have closed properly.")
             stop_trading = True
             return  # Optional: cleaner than os._exit(0)
         time.sleep(2)
@@ -962,37 +980,51 @@ def emergency_floating_loss_guard():
         
 threading.Thread(target=emergency_floating_loss_guard, daemon=True).start()
 
+def listen_for_hesitation_toggle():
+    global HESITATION_MODE
 
-#import os
+    while True:
+        try:
+            user_input = input().strip().lower()
+            if user_input == 'b+':
+                HESITATION_MODE = True
+                print("[HESITATION MODE] Activated (6-second interval).")
+            elif user_input == 'b-':
+                HESITATION_MODE = False
+                print("[HESITATION MODE] Deactivated (back to 10-second interval).")
+        except Exception as e:
+            print(f"[Input Error] {e}")
+            
+input_thread = threading.Thread(target=listen_for_hesitation_toggle, daemon=True)
+input_thread.start()
+
+def check_hesitation_flags():
+    global HESITATION_MODE
+
+    hesitation_on_flag = "hesitation_mode_on.flag"
+    hesitation_off_flag = "hesitation_mode_off.flag"
+
+    if os.path.exists(hesitation_on_flag):
+        HESITATION_MODE = True
+        print("[FLAG] Hesitation mode ON detected via flag file.")
+        os.remove(hesitation_on_flag)
+
+    if os.path.exists(hesitation_off_flag):
+        HESITATION_MODE = False
+        print("[FLAG] Hesitation mode OFF detected via flag file.")
+        os.remove(hesitation_off_flag)
+
 
 def main_loop():
     global trade_count, initial_equity, last_trading_day, stop_trading
-    global TRAILING_SL_DOLLARS_PER_LOT, TRAILING_SL_DOLLARS
-
-    # Adjust this path to the exact folder where your flags are saved
-    flag_dir = "E:/POSITION BUILDER/Position Builder O+ Versions/"
-    flag_path = os.path.join(flag_dir, "close_xauusd.flag")
+    global TRAILING_SL_DOLLARS_PER_LOT  # to update the global variable
 
     while True:
+        check_hesitation_flags()
+
         if stop_trading:
             print("Stopping main trading loop due to shutdown signal.")
             break  # exit the loop cleanly
-
-        # --- Flag check injection START ---
-        print(f"[DEBUG] Checking for flag file at: {flag_path}")
-        if os.path.exists(flag_path):
-            print(f"[FLAG] Detected {flag_path} – Closing trades now.")
-            print(f"[DEBUG] Closing positions for symbol: '{SYMBOL}'")
-            success = close_all_positions(SYMBOL)
-            if success:
-                print("All positions closed successfully due to flag.")
-            else:
-                print("Some positions may not have closed correctly.")
-            os.remove(flag_path)
-            print(f"[FLAG] {flag_path} removed after execution.")
-            stop_trading = True
-            break
-        # --- Flag check injection END ---
 
         today_closed_profit = calculate_today_net_profit(SYMBOL, COMMENT_KEY, from_time=SCRIPT_START_TIME)
         current_day = get_amman_date()
@@ -1008,6 +1040,42 @@ def main_loop():
         print(f"Current floating loss: ${floating_loss:.2f}")
         print(f"Realized closed profit today: ${today_closed_profit:.2f}")
 
+        # Check for close flag from Telegram
+        flag_path = "close_us500roll.flag"
+        if os.path.exists(flag_path):
+            print("[FLAG] Detected close_us500roll.flag – Closing trades now.")
+            close_all_positions(SYMBOL)
+            os.remove(flag_path)
+            print("[FLAG] close_us500roll.flag removed after execution.")
+            stop_trading = True
+            break
+
+        # Check hesitation mode flags from Telegram
+        hesitation_on_flag = "hesitation_mode_on.flag"
+        hesitation_off_flag = "hesitation_mode_off.flag"
+
+        if os.path.exists(hesitation_on_flag):
+            HESITATION_MODE = True
+            print("[FLAG] Hesitation mode ON detected via flag file.")
+            os.remove(hesitation_on_flag)
+
+        if os.path.exists(hesitation_off_flag):
+            HESITATION_MODE = False
+            print("[FLAG] Hesitation mode OFF detected via flag file.")
+            os.remove(hesitation_off_flag)
+        
+
+        # Emergency stop if floating loss reaches threshold
+        if floating_loss >= Decimal(Emergency_Stop_Loss):
+            print(f"Emergency stop: Floating loss reached ${floating_loss:.2f}. Closing all positions and halting trading.")
+            success = close_all_positions(SYMBOL)
+            if success:
+                print("All positions closed successfully due to floating loss limit.")
+            else:
+                print("Some positions may not have closed correctly.")
+            stop_trading = True
+            break
+
         if today_closed_profit >= FLOATING_PROFIT_PROTECT_THRESHOLD:
             if FLOATING_LOSS_LIMIT_PERCENT > 0 and floating_loss >= today_closed_profit * FLOATING_LOSS_LIMIT_PERCENT:
                 print(f"Floating loss ${floating_loss:.2f} exceeds {FLOATING_LOSS_LIMIT_PERCENT*100:.1f}% of today’s profit ${today_closed_profit:.2f}.")
@@ -1018,28 +1086,34 @@ def main_loop():
         positions = mt5.positions_get(symbol=SYMBOL)
         buy_targets = [p for p in positions if COMMENT_KEY in p.comment and p.type == mt5.ORDER_TYPE_BUY] if positions else []
 
-        # --- Trailing SL adjustment injection START ---
+        print(f"Active Trades: {len(buy_targets)} | Total Opened: {trade_count}/{MAX_TRADES}")
+
+        # Trailing SL adjustment for SELL trades
         if positions:
-            for pos in positions:
-                if COMMENT_KEY not in pos.comment:
-                    continue
+            sell_trades = [p for p in positions if p.type == mt5.ORDER_TYPE_SELL and COMMENT_KEY in p.comment]
+            for pos in sell_trades:
                 entry_price = pos.price_open
                 sl_price = pos.sl
                 if entry_price and sl_price:
-                    if pos.type == mt5.ORDER_TYPE_BUY:
-                        sl_gain = sl_price - entry_price
-                    elif pos.type == mt5.ORDER_TYPE_SELL:
-                        sl_gain = entry_price - sl_price
-                    else:
-                        continue
-
+                    sl_gain = entry_price - sl_price  # For SELL trades: profit if SL moves below entry
                     if sl_gain >= 1.5 and TRAILING_SL_DOLLARS_PER_LOT != NEW_TRAILING_SL_DOLLARS_PER_LOT:
                         TRAILING_SL_DOLLARS_PER_LOT = NEW_TRAILING_SL_DOLLARS_PER_LOT
-                        TRAILING_SL_DOLLARS = TRAILING_SL_DOLLARS_PER_LOT * LOT
                         print(f"[DEBUG] Adjusted TRAILING_SL_DOLLARS_PER_LOT to {TRAILING_SL_DOLLARS_PER_LOT} after ${sl_gain:.2f} SL gain")
-        # --- Trailing SL adjustment injection END ---
 
-        print(f"Active Trades: {len(buy_targets)} | Total Opened: {trade_count}/{MAX_TRADES}")
+        # Trailing SL tightening logic for BUY trades
+        float_profit = 0
+        if buy_targets:
+            float_profit = sum(p.profit for p in buy_targets)
+
+        if float_profit >= FLOAT_PROFIT_TIGHTEN_THRESHOLD:
+            if TRAILING_SL_DOLLARS_PER_LOT * LOT != TRAILING_SL_DOLLARS:  # TRAILING_SL_DOLLARS = TRAILING_SL_DOLLARS_PER_LOT * LOT
+                print("[DEBUG] Floating profit >= threshold, reverting trailing SL to tighter value")
+                TRAILING_SL_DOLLARS_PER_LOT = TRAILING_SL_DOLLARS / LOT  # tighten trailing SL back to default
+        else:
+            if float_profit >= TRAILING_TRIGGER_DOLLARS:
+                if TRAILING_SL_DOLLARS_PER_LOT != NEW_TRAILING_SL_DOLLARS_PER_LOT:
+                    print("[DEBUG] Floating profit >= trailing trigger, activating more aggressive trailing SL")
+                    TRAILING_SL_DOLLARS_PER_LOT = NEW_TRAILING_SL_DOLLARS_PER_LOT
 
         if len(buy_targets) == 0 and not stop_trading:
             ticket = open_buy_order()
@@ -1052,8 +1126,6 @@ def main_loop():
             continue
         else:
             print(f"Buy position already open or trading stopped. Waiting...")
-##            for pos in buy_targets:
-##                manage_trailing_sl(pos.ticket)
 
         if not mt5.terminal_info().trade_allowed:
             print("AutoTrading is disabled. Waiting...")
@@ -1085,11 +1157,13 @@ def main_loop():
 
         if trade_count >= MAX_TRADES:
             print(f"Trade count limit reached ({trade_count}/{MAX_TRADES}). No more trades will be opened.")
-            time.sleep(SLEEP_INTERVAL)
-            continue
+
+        loop_interval = HESITATION_CHECK_INTERVAL if HESITATION_MODE else NORMAL_CHECK_INTERVAL
+        print(f"[Loop] Mode: {'HESITATION' if HESITATION_MODE else 'NORMAL'} | Sleeping for {loop_interval} seconds.")
 
         check_closed_trades_and_popup()
-        time.sleep(SLEEP_INTERVAL)
+
+        time.sleep(loop_interval)
 
     # After exiting loop, clean up:
     print("Shutting down MT5 connection...")
@@ -1100,4 +1174,3 @@ def main_loop():
 
 # Start the main trading loop
 main_loop()
-
